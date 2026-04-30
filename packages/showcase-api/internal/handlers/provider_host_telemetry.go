@@ -1,25 +1,27 @@
-package providers
+package handlers
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	managementv1 "code-code.internal/go-contract/platform/management/v1"
-	providerv1 "code-code.internal/go-contract/provider/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const providerHostTelemetryQuery = `last_over_time({job="provider-host-latency",__name__=~"probe_success|probe_duration_seconds|probe_http_status_code"}[5m])`
 
-type HostTelemetryProviderService struct {
-	delegate providerService
-	prom     promQueryExecutor
+type ProviderHostTelemetryClient struct {
+	baseURL    string
+	httpClient *http.Client
 }
 
 type providerHostTelemetryTarget struct {
@@ -38,66 +40,37 @@ type providerHostTelemetryPoint struct {
 	sampledAt  *timestamppb.Timestamp
 }
 
-func NewHostTelemetryProviderService(delegate providerService, prom promQueryExecutor) (*HostTelemetryProviderService, error) {
-	if delegate == nil {
-		return nil, fmt.Errorf("consoleapi/providers: host telemetry provider delegate is nil")
+type prometheusVectorResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		Result []prometheusVectorSample `json:"result"`
+	} `json:"data"`
+}
+
+type prometheusVectorSample struct {
+	Metric    map[string]string `json:"metric"`
+	ValuePair []json.RawMessage `json:"value"`
+}
+
+func NewProviderHostTelemetryClient(baseURL string) *ProviderHostTelemetryClient {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return nil
 	}
-	if prom == nil {
-		return nil, fmt.Errorf("consoleapi/providers: host telemetry prometheus query client is nil")
+	return &ProviderHostTelemetryClient{
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: 5 * time.Second},
 	}
-	return &HostTelemetryProviderService{delegate: delegate, prom: prom}, nil
 }
 
-func (s *HostTelemetryProviderService) ListProviderSurfaceMetadata(ctx context.Context) ([]*providerv1.ProviderSurface, error) {
-	return s.delegate.ListProviderSurfaceMetadata(ctx)
-}
-
-func (s *HostTelemetryProviderService) ListProviders(ctx context.Context) ([]*managementv1.ProviderView, error) {
-	items, err := s.delegate.ListProviders(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return s.attachHostTelemetry(ctx, items), nil
-}
-
-func (s *HostTelemetryProviderService) UpdateProvider(ctx context.Context, providerID string, request *managementv1.UpdateProviderRequest) (*managementv1.ProviderView, error) {
-	return s.delegate.UpdateProvider(ctx, providerID, request)
-}
-
-func (s *HostTelemetryProviderService) UpdateProviderAuthentication(ctx context.Context, providerID string, request *managementv1.UpdateProviderAuthenticationRequest) (*managementv1.UpdateProviderAuthenticationResponse, error) {
-	return s.delegate.UpdateProviderAuthentication(ctx, providerID, request)
-}
-
-func (s *HostTelemetryProviderService) UpdateProviderObservabilityAuthentication(ctx context.Context, providerID string, request *managementv1.UpdateProviderObservabilityAuthenticationRequest) (*managementv1.ProviderView, error) {
-	return s.delegate.UpdateProviderObservabilityAuthentication(ctx, providerID, request)
-}
-
-func (s *HostTelemetryProviderService) DeleteProvider(ctx context.Context, providerID string) error {
-	return s.delegate.DeleteProvider(ctx, providerID)
-}
-
-func (s *HostTelemetryProviderService) Connect(ctx context.Context, request *managementv1.ConnectProviderRequest) (*managementv1.ConnectProviderResponse, error) {
-	return s.delegate.Connect(ctx, request)
-}
-
-func (s *HostTelemetryProviderService) GetConnectSession(ctx context.Context, sessionID string) (*managementv1.ProviderConnectSessionView, error) {
-	return s.delegate.GetConnectSession(ctx, sessionID)
-}
-
-func (s *HostTelemetryProviderService) WatchStatusEvents(ctx context.Context, providerIDs []string, yield func(*managementv1.ProviderStatusEvent) error) error {
-	return s.delegate.WatchStatusEvents(ctx, providerIDs, yield)
-}
-
-func (s *HostTelemetryProviderService) attachHostTelemetry(ctx context.Context, providers []*managementv1.ProviderView) []*managementv1.ProviderView {
+func attachProviderHostTelemetry(ctx context.Context, providers []*managementv1.ProviderView, client *ProviderHostTelemetryClient) {
 	targets := providerHostTelemetryTargetsFromProviders(providers)
 	if len(targets) == 0 {
-		return providers
+		return
 	}
 	points := map[string]*providerHostTelemetryPoint{}
-	if s != nil && s.prom != nil {
-		if samples, err := s.prom.QueryVector(ctx, providerHostTelemetryQuery); err == nil {
-			points = providerHostTelemetryPointsFromSamples(samples)
-		}
+	if client != nil {
+		points = providerHostTelemetryPointsFromSamples(client.queryVector(ctx))
 	}
 	for _, provider := range providers {
 		if provider == nil {
@@ -111,7 +84,33 @@ func (s *HostTelemetryProviderService) attachHostTelemetry(ctx context.Context, 
 		}
 		provider.HostTelemetry = sortedProviderHostTelemetry(providerTelemetryByKey)
 	}
-	return providers
+}
+
+func (c *ProviderHostTelemetryClient) queryVector(ctx context.Context) []prometheusVectorSample {
+	if c == nil || c.httpClient == nil || c.baseURL == "" {
+		return nil
+	}
+	requestURL := c.baseURL + "/api/v1/query?query=" + url.QueryEscape(providerHostTelemetryQuery)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return nil
+	}
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return nil
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil
+	}
+	var payload prometheusVectorResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return nil
+	}
+	if payload.Status != "success" {
+		return nil
+	}
+	return payload.Data.Result
 }
 
 func providerHostTelemetryTargetsFromProviders(providers []*managementv1.ProviderView) map[string]providerHostTelemetryTarget {
@@ -125,7 +124,7 @@ func providerHostTelemetryTargetsFromProviders(providers []*managementv1.Provide
 	return targets
 }
 
-func providerHostTelemetryPointsFromSamples(samples []promVectorSample) map[string]*providerHostTelemetryPoint {
+func providerHostTelemetryPointsFromSamples(samples []prometheusVectorSample) map[string]*providerHostTelemetryPoint {
 	points := map[string]*providerHostTelemetryPoint{}
 	for _, sample := range samples {
 		target, ok := providerHostTelemetryTargetFromMetric(sample.Metric)
@@ -137,10 +136,13 @@ func providerHostTelemetryPointsFromSamples(samples []promVectorSample) map[stri
 			point = &providerHostTelemetryPoint{target: target}
 			points[target.key] = point
 		}
-		if point.sampledAt == nil || sample.Timestamp.After(point.sampledAt.AsTime()) {
-			point.sampledAt = timestamppb.New(sample.Timestamp)
+		value, timestamp, ok := sample.value()
+		if !ok {
+			continue
 		}
-		value := sample.Value
+		if point.sampledAt == nil || timestamp.After(point.sampledAt.AsTime()) {
+			point.sampledAt = timestamppb.New(timestamp)
+		}
 		switch strings.TrimSpace(sample.Metric["__name__"]) {
 		case "probe_success":
 			point.success = &value
@@ -151,6 +153,26 @@ func providerHostTelemetryPointsFromSamples(samples []promVectorSample) map[stri
 		}
 	}
 	return points
+}
+
+func (s prometheusVectorSample) value() (float64, time.Time, bool) {
+	if len(s.ValuePair) != 2 {
+		return 0, time.Time{}, false
+	}
+	var ts float64
+	if err := json.Unmarshal(s.ValuePair[0], &ts); err != nil {
+		return 0, time.Time{}, false
+	}
+	var raw string
+	if err := json.Unmarshal(s.ValuePair[1], &raw); err != nil {
+		return 0, time.Time{}, false
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, time.Time{}, false
+	}
+	sec, frac := math.Modf(ts)
+	return value, time.Unix(int64(sec), int64(frac*1e9)), true
 }
 
 func providerHostTelemetryTargetFromMetric(metric map[string]string) (providerHostTelemetryTarget, bool) {
@@ -278,5 +300,3 @@ func cloneProviderHostTelemetry(item *managementv1.ProviderHostTelemetry) *manag
 	}
 	return proto.Clone(item).(*managementv1.ProviderHostTelemetry)
 }
-
-var _ providerService = (*HostTelemetryProviderService)(nil)
