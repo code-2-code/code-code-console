@@ -4,9 +4,15 @@ Console BFF, console web UI, and showcase-facing application surfaces for Code C
 
 This repository owns:
 
-- `packages/console-api`: console HTTP/BFF services and the current chat service implementation.
-- `packages/console-web`: React console and showcase web workspaces.
-- `packages/showcase-api`: showcase HTTP API.
+- `packages/console-api`: aggregate copy of console HTTP/BFF services and the current chat service implementation.
+- `packages/console-web`: aggregate copy of React console and showcase web workspaces.
+- `packages/showcase-api`: aggregate copy of showcase HTTP API.
+
+Focused console splits now exist:
+
+- `code-code-console-api`: console BFF and chat HTTP services.
+- `code-code-console-web`: React console and showcase web workspaces.
+- `code-code-showcase-api`: showcase-facing HTTP API.
 
 This split preserves source history from the original monorepo. Contract
 dependency migration is the next step: console code should consume
